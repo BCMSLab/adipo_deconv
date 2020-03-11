@@ -9,7 +9,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE, message = FALSE)
 ```
 
-# Loading data
+# Loading libraries
 
 ```{r load_libraries}
 library(debCAM)
@@ -20,6 +20,10 @@ library(clusterProfiler)
 library(org.Mm.eg.db)
 library(GO.db)
 library(pdist)
+library(ComplexHeatmap)
+library(circlize)
+library(limma)
+library(PSEA)
 ```
 
 ## 3T3-L1 mouse cell line
@@ -40,7 +44,7 @@ mds <- cmdscale(dist(t(log2(mat + 1))))
 mds <- as.data.frame(mds)
 ```
 
-```{r }
+```{r plot_mds}
 (as_tibble(mds) %>%
     mutate(stage = stage) %>%
     ggplot(aes(x = V1, y = V2, color = as.factor(stage))) +
@@ -55,7 +59,7 @@ mds <- as.data.frame(mds)
            height = 9, width = 9, units = 'cm')
 ```
 
-```{r}
+```{r deconvolve_mouse}
 # set a seed
 set.seed(111)
 
@@ -72,7 +76,7 @@ rCAM <- CAM(mat,
 mdl <- MDL(rCAM)
 ```
 
-```{r}
+```{r mdl_plot}
 (tibble(Data = mdl@datalengths,
         Model = mdl@mdls,
         k = mdl@K) %>%
@@ -89,7 +93,7 @@ mdl <- MDL(rCAM)
            height = 9, width = 9, units = 'cm')
 ```
 
-```{r}
+```{r extract_estimates}
 # extract estimate matrices and markers
 n <- 3
 aset <- Amat(rCAM, n)
@@ -97,7 +101,7 @@ sset <- Smat(rCAM, n)
 markers <- MGsforA(rCAM, n)
 ```
 
-```{r}
+```{r fraction_time_plot}
 (aset %>%
     as_tibble() %>%
     setNames(paste0('P', 1:3)) %>%
@@ -115,14 +119,15 @@ markers <- MGsforA(rCAM, n)
            height = 9, width = 9, units = 'cm',)
 ```
 
-```{r}
+```{r get_simplex}
+# extract simplex data
 simplex <- debCAM::simplexplot(mat,
-                    aset,
-                    markers,
-                    plot = FALSE)
+                               aset,
+                               markers,
+                               plot = FALSE)
 ```
 
-```{r}
+```{r simplex_plot}
 df <- as_tibble(t(simplex)) %>%
     mutate(gene = rownames(t(simplex))) %>%
     left_join(melt(markers) %>% setNames(c('gene', 'pop'))) %>%
@@ -140,7 +145,7 @@ df <- as_tibble(t(simplex)) %>%
            height = 9, width = 9, units = 'cm',)
 ```
 
-```{r}
+```{r enrichment}
 # perform enrichment analysis on the markers
 # extract annotations
 symbols <- keys(org.Mm.eg.db, 'SYMBOL')
@@ -168,7 +173,7 @@ comp <- map_df(markers_symbols,
             }, .id = 'population')
 ```
 
-```{r}
+```{r enrichment_tabl}
 # merge annotation and enrichemnt
 inner_join(terms, comp) %>%
     dplyr::filter(p.adjust < .2, Count > 2) %>%
@@ -177,27 +182,31 @@ inner_join(terms, comp) %>%
     write_csv('manuscript/marker_enrichment.csv')
 ```
 
-```{r}
+```{r markers_plot}
 # plot the adipogenic markers
-adipo_markers <- list('Adipogenic' = c('Pparg', 'Cebpb', 'Cebpa'),
-                      'Lipogenic' = c('Lpl', 'Acly', 'Fasn'))
+adipo_markers <- list('Adipogenic' = c('Pparg', 'Cebpb', 'Cebpa', 'Adipoq'),
+                      'Lipogenic' = c('Lpl', 'Acly', 'Fasn', 'Plin1', 'Lipe'))
 
 adipo_mat <- sset[rownames(sset) %in% unlist(adipo_markers),]
 
 colnames(adipo_mat) <- paste0('P', 1:3)
-adipo_mat <- adipo_mat[unlist(adipo_markers), c(1, 3, 2)]
-(melt(log2(adipo_mat + 1)) %>%
-    ggplot(aes(x = Var2, y = Var1, fill = value)) +
-    geom_tile() +
-    scale_fill_gradient(low = 'white', high = 'darkblue') +
-    theme_minimal() +
-    labs(x = '', y = '', fill = 'Expression')) %>%
-    ggsave(plot = .,
-           filename = 'manuscript/adipogenic_markers.png',
-           height = 7, width = 8, units = 'cm')
+
+png(filename = 'manuscript/adipogenic_markers.png',
+    height = 9, width = 7, units = 'cm', res = 300)
+
+exprs_color <- colorRamp2(c(0, 20), c('white', 'darkblue'))
+
+Heatmap(log2(adipo_mat + 1),
+        col = exprs_color,
+        row_split = rep(names(adipo_markers), lengths(adipo_markers)),
+        show_heatmap_legend = FALSE,
+        column_names_rot = 0,
+        column_names_centered = TRUE)
+dev.off()
 ```
 
-```{r}
+```{r markers_stats}
+# calculate markers stats (fold-change)
 markers_stats <- MGstatistic(mat + .01,
                              aset,
                              boot.alpha = 0.05,
@@ -205,7 +214,7 @@ markers_stats <- MGstatistic(mat + .01,
                              cores = 4)
 ```
 
-```{r}
+```{r markers_fc_plot}
 (markers_stats %>%
     rownames_to_column('gene') %>%
     dplyr::filter(gene %in% unlist(markers), OVE.FC != Inf, !grepl('Rik', gene)) %>%
@@ -227,7 +236,7 @@ markers_stats <- MGstatistic(mat + .01,
            height = 7, width = 9, units = 'cm')
 ```
 
-```{r}
+```{r human_cell}
 # primary adipocytes
 primary_se <- read_rds('data/primary_adipocyte.rds')
 
@@ -235,21 +244,26 @@ primary_mat <- 2 ^ na.omit(exprs(primary_se))
 group <- primary_se$group
 ```
 
-```{r}
-
+```{r estimate_human}
+# subset to common gene symbols
 new_markers <- map(markers, function(x) {
                        intersect(toupper(x), rownames(primary_mat))
                    })
 
+# estimate the populations fractions
+set.seed(111)
 rre <- redoASest(primary_mat, new_markers, maxIter = 10)
 ```
 
-```{r}
+```{r primary_plot}
 df <- as_tibble(rre$Aest) %>%
     setNames(paste0('P', 1:3)) %>%
     mutate(group = factor(group, levels = c('NDf', 'Df'))) %>%
     gather(pop, frac, -group)
-ave <- df %>% group_by(pop, group) %>% summarise(frac = mean(frac))
+
+ave <- df %>% 
+    group_by(pop, group) %>%
+    summarise(frac = mean(frac))
 
 (df %>% 
     ggplot() +
@@ -266,42 +280,48 @@ ave <- df %>% group_by(pop, group) %>% summarise(frac = mean(frac))
            height = 9, width = 9, units = 'cm')
 ```
 
-```{r}
+```{r distances}
+# calculate distance between sub-populations
+## common symbols
 ind <- intersect(toupper(rownames(sset)), rownames(rre$Sest))
 
+## rename rows
 mm <- sset
 rownames(mm) <- toupper(rownames(mm))
 
+## subset matrix
 mm <- mm[ind,]
 hs <- rre$Sest[ind,]
 
-all(toupper(rownames(mm)) == rownames(hs))
-
+## get distances
 d <- as.matrix(pdist(t(log2(mm + 1)), t(log2(hs + 1))))
+
+## rename columns and rows
 rownames(d) <- paste0('P', 1:3)
 colnames(d) <- paste0('P', 1:3)
 ```
 
-```{r}
-(melt((d)/100) %>%
-    ggplot(aes(x = Var1, y = Var2, fill = value)) +
-    geom_tile() +
-    theme_minimal() +
-    scale_fill_gradient(low = 'white', high = 'darkblue') +
-    labs(x = 'Mouse 3T3-L1 Model',
-         y = 'Human Primary Adipocyte',
-         fill = 'Distance')) %>%
-    ggsave(plot = .,
-           filename = 'manuscript/distances.png',
-           height = 7, width = 9, units = 'cm')
+```{r distances_plot}
+png(filename = 'manuscript/distances.png',
+    height = 7, width = 7, units = 'cm', res = 300)
+dmat <- (d/min(d)) - 1 
+dist_color <- colorRamp2(c(0, max(dmat)), c('white', 'darkblue'))
+Heatmap(dmat, 
+        col = dist_color,
+        show_heatmap_legend = FALSE,
+        column_names_rot = 0,
+        column_names_centered = TRUE)
+dev.off()
 ```
 
-```{r}
+```{r occupancy}
+# get counts in peaks
 peak_counts <- read_rds('data/peak_counts.rds')
 
-table(peak_counts$factor == 'POLR2A')
+# subset to POLR2A
 se_pol <- peak_counts[, grepl('POLR2A', peak_counts$factor)]
 
+# aggregate by gene
 mat_pol <- assay(se_pol) %>%
     as_tibble() %>%
     mutate(gene = as.character(mcols(se_pol)$geneId)) %>%
@@ -309,10 +329,14 @@ mat_pol <- assay(se_pol) %>%
     summarise_all(sum) %>%
     ungroup() %>%
     column_to_rownames('gene')
+```
 
+```{r estimate_fractions_occupance}
+# estimate fractions based on occupancy
 rre_pol <- redoASest(mat_pol, markers, maxIter = 10)
+```
 
-head(rre_pol$Aest)
+```{r occupancy_fractions}
 (rre_pol$Aest %>%
     as_tibble() %>%
     setNames(paste0('P', 1:3)) %>%
@@ -330,22 +354,28 @@ head(rre_pol$Aest)
            height = 9, width = 9, units = 'cm')
 ```
 
-```{r}
+```{r iterations}
+# run iterated estimations of fractions
 iterated_rre <- rerun(100, {
+    # sample markers to lowest group number 
     m <- map(markers, ~sample(.x, 35))
+    
+    # estimate fractions
     a <- redoASest(mat,
               m,
               maxIter = 2,
               methy = FALSE)
+    
+    # formate the coutpus
     a$Aest %>%
-    as_tibble() %>%
-    setNames(paste0('P', 1:3)) %>%
-    mutate(time = adipo_counts$time)
+        as_tibble() %>%
+        setNames(paste0('P', 1:3)) %>%
+        mutate(time = adipo_counts$time)
 }) %>%
     bind_rows(.id = 'iteration')
 ```
 
-```{r}
+```{r interations_plot}
 (iterated_rre %>%
     gather(pop, frac, -time,-iteration) %>%
     ggplot(aes(y = frac, x = time,group = iteration)) +
@@ -361,3 +391,166 @@ iterated_rre <- rerun(100, {
            height = 7, width = 12, units = 'cm')
 ```
 
+```{r perturbations}
+# load selected sample info
+selected_samples <- read_csv('data/perturbations_md.csv')
+selected_list <- split(selected_samples, selected_samples$series_id)
+
+# load and subset data
+pharma <- read_rds('data/pharmacological_perturbation.rds')
+pharma_mats <- map(selected_list, function(x) {
+    se <- pharma[, colnames(pharma) %in% x$sample_id]
+    na.omit(assay(se))
+})
+pharma_mats$GSE42220 <- 2^pharma_mats$GSE42220
+pharma_mats$GSE64075 <- 2^pharma_mats$GSE64075
+```
+
+```{r deconv_pharma}
+# run deconv
+pharma_rre <- map(pharma_mats, function(x) {
+    redoASest(x, markers)
+})
+
+# extract fractions
+pharma_fractions <- map_df(pharma_rre, function(x) {
+    as_tibble(x$Aest) %>%
+        setNames(paste0('P', 1:3)) %>%
+        mutate(sample_id = rownames(x$Aest))
+}, .id = 'series_id') %>%
+    gather(pop, frac, starts_with('P'))
+```
+
+```{r differential_expresison}
+# mixture differential expression
+pharma_de <- map2_df(pharma_mats, selected_list, function(x, y) {
+    # make factor of the treatment type
+    fac <- factor(y$treatment_type)
+    
+    # make a model matris
+    mod <- model.matrix(~ fac)
+    colnames(mod) <- levels(fac)
+    
+    # fit by the model
+    fit <- lmFit(log2(x + 1), mod)
+    fit <- eBayes(fit)
+    
+    coeff <- colnames(mod)[-1]
+    names(coeff) <- coeff
+    
+    # extract toptable for each coefficient
+    map_df(coeff, function(f) {
+        topTable(fit,
+                 coef = f,
+                 number = Inf,
+                 genelist = rownames(x)) %>%
+            as_tibble() %>%
+            dplyr::rename(gene_id = ID)
+    }, .id = 'treatment_type')
+}, .id = 'series_id')
+```
+
+```{r populations_specific}
+# population specific expression
+markers <- markers
+names(markers) <- paste0('P', 1:3)
+
+# population specific expression analysis
+pharma_psa <- map2_df(pharma_mats, selected_list, function(m, f) {
+    # extract treatment types other than control
+    trt <- f$treatment_type[!grepl('control', f$treatment_type)]
+    
+    # map over treatment types
+    map_df(trt, function(x) {
+        # subset expression matrix
+        ind <- f$treatment_type %in% c('control', x)
+        mm <- m[, ind]
+        
+        # make a treatment vs control factor
+        fac <- as.numeric(factor(f$treatment_type[ind])) - 1
+        
+        # map over the sub-populations
+        map_df(markers, function(r, .y) {
+            # extract the reference expression
+            ref <- PSEA::marker(mm, intersect(rownames(mm), r))
+            
+            # factor the treament vs control in the reference
+            dif <- fac * ref
+            
+            # make a model matrix and fit
+            mod <- model.matrix(~ ref + dif)
+            fit <- limma::lmFit(log2(mm + 1), mod)
+            
+            # make a contrast matrix and fit
+            cont.mat <- makeContrasts(dif-ref, levels = mod)
+            fit2 <- contrasts.fit(fit, cont.mat)
+            fit2 <- limma::eBayes(fit2)
+            
+            # extract top tables
+            topTable(fit2, coef = 1, number = Inf, genelist = rownames(mm)) %>%
+                mutate(treatment_type = x)
+        }, .id = 'pop')
+    })
+})
+```
+
+```{r perturbations_plot}
+adipo_markers_df <- tibble(
+    marker_type = rep(c('Adipogenic', 'Lipogenic'), each = 4),
+    gene_id = c('Pparg', 'Cebpb', 'Cebpa', 'Adipoq', 'Lpl', 'Acly', 'Fasn', 'Lipe')
+) %>%
+    arrange(gene_id)
+
+hmb <- pharma_de %>%
+    inner_join(adipo_markers_df) %>%
+    inner_join(dplyr::select(selected_samples, -sample_id)) %>%
+    dcast(treatment_category + treatment_type ~ gene_id, value.var = 'logFC', fun.aggregate = mean) %>%
+    with({
+        m <- dplyr::select(., -starts_with('treatment')) %>% as.matrix()
+        rownames(m) <- .$treatment_type
+        Heatmap(scale(m),
+                name = 'Fold-change',
+                col = de_color,
+                cluster_rows = FALSE,
+                cluster_row_slices = FALSE,
+                column_title = NULL,
+                cluster_columns = FALSE,
+                cluster_column_slices = FALSE,
+                row_split = .$treatment_category,
+                column_split = adipo_markers_df$marker_type,
+                heatmap_legend_param = list(direction = "horizontal"),
+                show_heatmap_legend = FALSE)
+    })
+
+psa <- as_tibble(pharma_psa) %>%
+    dplyr::select(gene_id = ID, everything()) %>%
+    inner_join(adipo_markers_df) %>%
+    inner_join(dplyr::select(selected_samples, -sample_id)) %>%
+    dcast(treatment_category + treatment_type + pop ~ gene_id,
+          value.var = 'logFC',
+          fun.aggregate = mean) %>%
+    with({
+        m <- dplyr::select(., 4:ncol(.)) %>% as.matrix()
+        rownames(m) <- ifelse(duplicated(.$treatment_type),
+                              .$pop, 
+                              paste(.$pop, .$treatment_type, sep = '_'))
+        Heatmap(scale(m),
+                name = 'Fold-change (log_2)',
+                row_split = .$treatment_category,
+                cluster_rows = FALSE,
+                cluster_row_slices = FALSE,
+                column_title = NULL,
+                cluster_columns = FALSE,
+                cluster_column_slices = FALSE,
+                column_split = adipo_markers_df$marker_type,
+                heatmap_legend_param = list(direction = "horizontal"),
+                show_heatmap_legend = FALSE)
+    })
+
+png(filename = 'manuscript/pharma_perturbations.png',
+    width = 12, height = 30, units = 'cm', res = 300)
+draw(psa %v% hmb,
+     heatmap_legend_side = "bottom", 
+     annotation_legend_side = "bottom")
+dev.off()
+```
