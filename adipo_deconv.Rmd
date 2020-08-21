@@ -24,39 +24,78 @@ library(ComplexHeatmap)
 library(circlize)
 library(limma)
 library(PSEA)
+library(xtable)
+library(deSolve)
+library(scales)
+library(cowplot)
+library(DESeq2)
+library(ggalt)
+library(gridExtra)
+library(png)
 ```
 
-## 3T3-L1 mouse cell line
+```{r get_data}
+#https://ndownloader.figshare.com/articles/12840101/versions/1
+#https://figshare.com/articles/dataset/Deconvolution_of_differentiating_adipocytes/12840101
+if (!file.exists('data.zip')) {
+    download.file(
+    'https://ndownloader.figshare.com/articles/12840101/versions/1',
+    destfile = 'data.zip'
+)
+    unzip('data.zip', exdir = 'data')
+}
+```
+
+data/adipo_counts.rds
+data/primary_adipocyte.rds
+%data/peak_counts.rds
+data/perturbations_md.csv
+data/pharmacological_perturbation.rds
 
 ```{r mouse_cell}
 # load gene counts
-load('data/adipo_counts.rda')
+adipo_counts <- read_rds('data/adipo_counts.rds')
 
 # subset the data
 mat <- assay(adipo_counts) 
 time <- adipo_counts$time 
-stage <- adipo_counts$stage
 ```
 
-```{r mouse_mds}
-# multidimensional scaling
-mds <- cmdscale(dist(t(log2(mat + 1))))
-mds <- as.data.frame(mds)
+```{r make_deseq_onject}
+# filter low samples stage
+se <- adipo_counts[, adipo_counts$stage %in% c(0, 1, 3)]
+
+# transform the data
+dds <- DESeqDataSet(se, ~stage)
+dds_transform <- vst(dds)
 ```
+
+```{r perform_mds}
+# multidimensional scaling
+mds <- cmdscale(dist(t(assay(dds_transform))))
+
+# format mds table
+mds <- mutate(as.data.frame(mds),
+              stage = ifelse(se$stage == 3, 'S2', paste0('S', se$stage)))
+```
+
 
 ```{r plot_mds}
-(as_tibble(mds) %>%
-    mutate(stage = stage) %>%
-    ggplot(aes(x = V1, y = V2, color = as.factor(stage))) +
+# make mds plot
+mds %>%
+    ggplot(aes(x = V1, y = V2, color = stage)) +
     geom_point() +
+    geom_encircle() +
     labs(x = 'Dimension One',
          y = 'Dimension Two',
          color = 'Differentiation') +
-    theme_linedraw() +
-    theme(legend.position = 'top')) %>%
-    ggsave(plot = .,
-           filename = 'manuscript/mds.png',
-           height = 9, width = 9, units = 'cm')
+    theme_bw() +
+    theme(legend.position = 'none',
+          panel.grid = element_blank(),
+          panel.border = element_rect(size = 1.2)) +
+    annotate('text', -50, 50, label = 'S0', color = 'red') +
+    annotate('text', 90, 50, label = 'S1', color = 'blue') +
+    annotate('text', 50, -50, label = 'S2', color = 'darkgreen') -> mds
 ```
 
 ```{r deconvolve_mouse}
@@ -72,25 +111,26 @@ rCAM <- CAM(mat,
 ```
 
 ```{r mdl}
-# plot mdl
+# calculate mdl
 mdl <- MDL(rCAM)
+
+# format mdl table
+mdl <- tibble(Data = mdl@datalengths,
+        Model = mdl@mdls,
+        k = mdl@K) %>%
+    gather(key, val, -k)
 ```
 
 ```{r mdl_plot}
-(tibble(Data = mdl@datalengths,
-        Model = mdl@mdls,
-        k = mdl@K) %>%
-    gather(key, val, -k) %>%
+# plot mdl
+mdl %>%
     ggplot(aes(x = k, y = val, group = key, color = key)) +
     geom_point() +
     geom_line(size = 1.2) +
     scale_y_continuous(labels = scales::scientific) + 
     labs(x = 'Number of Sources', y = 'Code Length', color = '') +
     theme_linedraw() + 
-    theme(legend.position = 'top')) %>%
-    ggsave(plot = .,
-           filename = 'manuscript/mdl.png',
-           height = 9, width = 9, units = 'cm')
+    theme(legend.position = 'top') -> mdl_plot
 ```
 
 ```{r extract_estimates}
@@ -99,10 +139,12 @@ n <- 3
 aset <- Amat(rCAM, n)
 sset <- Smat(rCAM, n)
 markers <- MGsforA(rCAM, n)
+names(markers) <- paste0('P', 1:3)
 ```
 
 ```{r fraction_time_plot}
-(aset %>%
+# plot fractions over time
+aset %>%
     as_tibble() %>%
     setNames(paste0('P', 1:3)) %>%
     mutate(time = time) %>%
@@ -110,13 +152,14 @@ markers <- MGsforA(rCAM, n)
     ggplot(aes(x = time, y = frac, color = pop, group = pop)) +
     geom_point() +
     geom_smooth(se = FALSE) +
-    labs(x = 'Time Point (hour)', y = 'Fraction of Cells',
-         color = 'Sub-population') + 
-    theme_linedraw() + 
-    theme(legend.position = 'top')) %>%
-    ggsave(plot = .,
-           filename = 'manuscript/fraction_time.png',
-           height = 9, width = 9, units = 'cm',)
+    labs(x = 'Time (hour)', y = 'Fraction of Cells') + 
+    theme_bw() + 
+    theme(legend.position = 'none',
+          panel.grid = element_blank(),
+          panel.border = element_rect(size = 1.5)) +
+    annotate('text', x = rep(260, 3), y = c(.03, .32, .65),
+             label = c('P3', 'P1', 'P2'),
+             color = c('blue', 'red', 'darkgreen')) -> fraction_time
 ```
 
 ```{r get_simplex}
@@ -125,30 +168,37 @@ simplex <- debCAM::simplexplot(mat,
                                aset,
                                markers,
                                plot = FALSE)
-```
 
-```{r simplex_plot}
-df <- as_tibble(t(simplex)) %>%
+# format simplex table
+simplex <- as_tibble(t(simplex)) %>%
     mutate(gene = rownames(t(simplex))) %>%
     left_join(melt(markers) %>% setNames(c('gene', 'pop'))) %>%
     mutate(pop = ifelse(!is.na(pop), paste0('P', pop), NA))
-(df %>%
-    ggplot(aes(x = V1, y = V2)) +
-    geom_point(color = 'gray') +
-    geom_point(data = na.omit(df), aes(color = pop)) + 
-    labs(x = 'Dimension One', y = 'Dimension Two',
-         color = 'Sup-Population') +
-    theme_linedraw() + 
-    theme(legend.position = 'top')) %>%
-    ggsave(plot = .,
-           filename = 'manuscript/simplexplot.png',
-           height = 9, width = 9, units = 'cm',)
 ```
 
-```{r enrichment}
-# perform enrichment analysis on the markers
+```{r simplex_plot}
+# plot simplex
+simplex %>%
+    ggplot(aes(x = V1, y = V2)) +
+    geom_point(color = 'gray') +
+    geom_point(data = na.omit(simplex), aes(color = pop)) + 
+    labs(x = 'Dimension One', y = 'Dimension Two',
+         color = 'Sup-Population') +
+    theme_bw() + 
+    theme(legend.position = 'none',
+          panel.grid = element_blank(),
+          panel.border = element_rect(size = 1.5)) +
+    annotate('text', x = c(-.05, .15, 0), y = c(-.25, 0, .2),
+             label = c('P3', 'P1', 'P2'),
+             color = c('blue', 'red', 'darkgreen')) -> simplexplot
+```
+
+```{r go_annotations}
 # extract annotations
+## get mouse gene symbols
 symbols <- keys(org.Mm.eg.db, 'SYMBOL')
+
+## get go ids to symbols
 term2gene <- AnnotationDbi::select(org.Mm.eg.db,
                     symbols,
                     'GO',
@@ -156,14 +206,18 @@ term2gene <- AnnotationDbi::select(org.Mm.eg.db,
     dplyr::select(term = GO, gene = SYMBOL) %>%
     unique()
 
+## get go terms
 terms <- as.data.frame(GOTERM)
 terms <- tibble(ID = terms$go_id,
                 term = terms$Term,
                 definition = terms$Definition,
                 ontology = terms$Ontology)
 
+## intersect markers symbols with go symbols
 markers_symbols <- map(markers, intersect, y = unique(term2gene$gene))
+```
 
+```{r enrichment}
 # run enrichment
 comp <- map_df(markers_symbols,
             function(x) {
@@ -173,26 +227,21 @@ comp <- map_df(markers_symbols,
             }, .id = 'population')
 ```
 
-```{r enrichment_tabl}
-# merge annotation and enrichemnt
-inner_join(terms, comp) %>%
-    dplyr::filter(p.adjust < .2, Count > 2) %>%
-    unique() %>%
-    group_by(population, ontology) %>%
-    write_csv('manuscript/marker_enrichment.csv')
-```
-
 ```{r markers_plot}
 # plot the adipogenic markers
 adipo_markers <- list('Adipogenic' = c('Pparg', 'Cebpb', 'Cebpa', 'Adipoq'),
                       'Lipogenic' = c('Lpl', 'Acly', 'Fasn', 'Plin1', 'Lipe'))
 
+# subset estimated expression by adipogenic markers
 adipo_mat <- sset[rownames(sset) %in% unlist(adipo_markers),]
+adipo_mat <- adipo_mat[unlist(adipo_markers),]
 
+# rename columns
 colnames(adipo_mat) <- paste0('P', 1:3)
 
+# make heatmap
 png(filename = 'manuscript/adipogenic_markers.png',
-    height = 9, width = 7, units = 'cm', res = 300)
+    height = 9, width = 6, units = 'cm', res = 300)
 
 exprs_color <- colorRamp2(c(0, 20), c('white', 'darkblue'))
 
@@ -202,6 +251,38 @@ Heatmap(log2(adipo_mat + 1),
         show_heatmap_legend = FALSE,
         column_names_rot = 0,
         column_names_centered = TRUE)
+
+dev.off()
+```
+
+```{r other_markers}
+#other_markers <- list(
+#    'Insulin' = c('Insr', 'Irs1', 'Slc2a4', 'Pdgfb'),
+#    'WT1' = c('Wt1', 'Ucp1'),
+#    'Keratins' = c('Krt5', 'Krt14', 'Krt15')
+#                      )
+
+other_markers <- c('Insr', 'Irs1', 'Slc2a4', 'Pdgfb')
+
+# subset the estimated expression matrix by other marekrs
+other_mat <- sset[rownames(sset) %in% other_markers,]
+other_mat <- other_mat[other_markers,]
+
+# rename the columns
+colnames(other_mat) <- paste0('P', 1:3)
+
+# make a plot
+png(filename = 'manuscript/other_markers.png',
+    height = 6, width = 6, units = 'cm', res = 300)
+
+exprs_color <- colorRamp2(c(0, 15), c('white', 'darkblue'))
+
+Heatmap(log2(other_mat + 1),
+        col = exprs_color,
+        show_heatmap_legend = FALSE,
+        column_names_rot = 0,
+        column_names_centered = TRUE)
+
 dev.off()
 ```
 
@@ -212,15 +293,18 @@ markers_stats <- MGstatistic(mat + .01,
                              boot.alpha = 0.05,
                              nboot = 1000,
                              cores = 4)
-```
 
-```{r markers_fc_plot}
-(markers_stats %>%
+# format markers statistics
+markers_stats <- markers_stats %>%
     rownames_to_column('gene') %>%
     dplyr::filter(gene %in% unlist(markers), OVE.FC != Inf, !grepl('Rik', gene)) %>%
     mutate(idx = paste0('P', idx),
            gene = fct_reorder(gene, OVE.FC)) %>%
-    group_by(idx) %>%
+    group_by(idx)
+```
+
+```{r markers_fc_plot}
+markers_stats %>%
     dplyr::slice(1:5) %>%
     ggplot(aes(x = gene, y = log2(OVE.FC))) +
     geom_col() +
@@ -229,15 +313,14 @@ markers_stats <- MGstatistic(mat + .01,
     theme_bw() +
     theme(axis.text.x = element_text(angle = 45, hjust = 1),
           strip.background = element_blank(),
-          panel.spacing = unit(-.05, 'cm')) +
-    labs(x = '', y = 'Fold-change (log_2)')) %>%
-    ggsave(plot = .,
-           filename = 'manuscript/markers_fc.png', 
-           height = 7, width = 9, units = 'cm')
+          panel.spacing = unit(-.05, 'cm'),
+          panel.grid = element_blank(),
+          panel.border = element_rect(size = 1.5)) +
+    labs(x = '', y = 'Fold-change (log_2)') -> markers_fc
 ```
 
 ```{r human_cell}
-# primary adipocytes
+# load primary adipocytes
 primary_se <- read_rds('data/primary_adipocyte.rds')
 
 primary_mat <- 2 ^ na.omit(exprs(primary_se))
@@ -252,32 +335,41 @@ new_markers <- map(markers, function(x) {
 
 # estimate the populations fractions
 set.seed(111)
-rre <- redoASest(primary_mat, new_markers, maxIter = 10)
-```
+rre <- redoASest(primary_mat,
+                 new_markers,
+                 maxIter = 10)
 
-```{r primary_plot}
-df <- as_tibble(rre$Aest) %>%
+# format re-restimated fractions
+rre_df <- as_tibble(rre$Aest) %>%
     setNames(paste0('P', 1:3)) %>%
     mutate(group = factor(group, levels = c('NDf', 'Df'))) %>%
     gather(pop, frac, -group)
 
-ave <- df %>% 
+rre_ave <- rre_df %>% 
     group_by(pop, group) %>%
-    summarise(frac = mean(frac))
+    dplyr::summarise(frac = mean(frac))
+```
 
-(df %>% 
+```{r primary_plot}
+# make a plot for the fractions in primary adipocytes
+rre_df %>% 
     ggplot() +
     geom_jitter(aes(x = group, y = frac, color = pop, group = pop),
                 width = .1) +
-    geom_point(data = ave, 
+    geom_point(data = rre_ave, 
                aes(x = group, y = frac, color = pop, group = pop)) +
-    geom_line(data = ave, aes(x = group, y = frac, color = pop, group = pop), size = 1) +
+    geom_line(data = rre_ave, aes(x = group, y = frac, color = pop, group = pop), size = 1) +
     theme_linedraw() +
     theme(legend.position = 'top') +
-    labs(x = '', y = 'Fraction of Cells', color = 'Sub-population')) %>%
-    ggsave(plot = .,
-           filename = 'manuscript/primary_adipocytes.png', 
-           height = 9, width = 9, units = 'cm')
+    labs(x = '', y = 'Fraction of Cells') +
+    theme_bw() + 
+    theme(legend.position = 'none',
+          panel.grid = element_blank(),
+          panel.border = element_rect(size = 1.5)) +
+    annotate('text', x = rep(2.3, 3), y = c(.05, .35, .62),
+             label = c('P3', 'P1', 'P2'),
+             color = c('blue', 'red', 'darkgreen')) +
+    scale_x_discrete(labels = c('HPP', 'HPP + MDI')) -> primary_adipocytes
 ```
 
 ```{r distances}
@@ -302,56 +394,58 @@ colnames(d) <- paste0('P', 1:3)
 ```
 
 ```{r distances_plot}
+# make a distance heatmap
 png(filename = 'manuscript/distances.png',
-    height = 7, width = 7, units = 'cm', res = 300)
+    height = 5, width = 5, units = 'cm', res = 300)
+
 dmat <- (d/min(d)) - 1 
+
 dist_color <- colorRamp2(c(0, max(dmat)), c('white', 'darkblue'))
+
 Heatmap(dmat, 
         col = dist_color,
         show_heatmap_legend = FALSE,
         column_names_rot = 0,
         column_names_centered = TRUE)
+
 dev.off()
 ```
 
 ```{r occupancy}
-# get counts in peaks
-peak_counts <- read_rds('data/peak_counts.rds')
-
-# subset to POLR2A
-se_pol <- peak_counts[, grepl('POLR2A', peak_counts$factor)]
-
-# aggregate by gene
-mat_pol <- assay(se_pol) %>%
-    as_tibble() %>%
-    mutate(gene = as.character(mcols(se_pol)$geneId)) %>%
-    group_by(gene) %>%
-    summarise_all(sum) %>%
-    ungroup() %>%
-    column_to_rownames('gene')
+# # get counts in peaks
+# peak_counts <- read_rds('data/peak_counts.rds')
+# 
+# # subset to POLR2A
+# se_pol <- peak_counts[, grepl('POLR2A', peak_counts$factor)]
+# 
+# # aggregate by gene
+# mat_pol <- assay(se_pol) %>%
+#     as_tibble() %>%
+#     mutate(gene = as.character(mcols(se_pol)$geneId)) %>%
+#     group_by(gene) %>%
+#     summarise_all(sum) %>%
+#     ungroup() %>%
+#     column_to_rownames('gene')
 ```
 
 ```{r estimate_fractions_occupance}
-# estimate fractions based on occupancy
-rre_pol <- redoASest(mat_pol, markers, maxIter = 10)
+# # estimate fractions based on occupancy
+# rre_pol <- redoASest(mat_pol, markers, maxIter = 10)
 ```
 
 ```{r occupancy_fractions}
-(rre_pol$Aest %>%
-    as_tibble() %>%
-    setNames(paste0('P', 1:3)) %>%
-    mutate(time = se_pol$time) %>%
-    gather(pop, frac, -time) %>%
-    ggplot(aes(x = time, y = frac, color = pop, group = pop)) +
-    geom_point() +
-    geom_smooth(se = FALSE) +
-    labs(x = 'Time Point (hour)', y = 'Fraction of Cells',
-         color = 'Sub-population') + 
-    theme_linedraw() + 
-    theme(legend.position = 'top')) %>%
-    ggsave(plot = .,
-           filename = 'manuscript/fraction_time_trans.png',
-           height = 9, width = 9, units = 'cm')
+# rre_pol$Aest %>%
+#     as_tibble() %>%
+#     setNames(paste0('P', 1:3)) %>%
+#     mutate(time = se_pol$time) %>%
+#     gather(pop, frac, -time) %>%
+#     ggplot(aes(x = time, y = frac, color = pop, group = pop)) +
+#     geom_point() +
+#     geom_smooth(se = FALSE) +
+#     labs(x = 'Time Point (hour)', y = 'Fraction of Cells',
+#          color = 'Sub-population') + 
+#     theme_linedraw() + 
+#     theme(legend.position = 'top') -> fraction_time_trans
 ```
 
 ```{r iterations}
@@ -375,20 +469,167 @@ iterated_rre <- rerun(100, {
     bind_rows(.id = 'iteration')
 ```
 
-```{r interations_plot}
-(iterated_rre %>%
+```{r iterations_plot}
+# make iterations plot
+iterated_rre %>%
     gather(pop, frac, -time,-iteration) %>%
-    ggplot(aes(y = frac, x = time,group = iteration)) +
+    ggplot(aes(y = frac, x = time, group = iteration)) +
     geom_smooth() +
     facet_wrap(~pop, nrow = 1) +
-    labs(x = 'Time Point (hour)', y = 'Fraction of Cells',
+    labs(x = 'Time (hour)', y = 'Fraction of Cells',
          color = 'Sub-population') + 
     theme_bw() + 
     theme(panel.spacing = unit(-.05, 'cm'),
-          strip.background = element_blank())) %>%
-    ggsave(plot = .,
-           filename = 'manuscript/fraction_time_iterations.png',
-           height = 7, width = 12, units = 'cm')
+          strip.background = element_blank(),
+          panel.grid = element_blank(),
+          panel.border = element_rect(size = 1.5)) -> fraction_time_iterations
+```
+
+```{r toy_model}
+toy_model <- ode(times = seq(1:48),                 # times
+    parms = c(r = .05),                # parameters
+    y = c(P1 = 90,
+          P2 = 10,
+          N = 100),# states
+    func = function(t, state, parms) {
+        with(as.list(c(parms, state)), {
+            dP1 = -r * P1
+            dP2 = r * P2
+            dN = (P2-P1) * r
+            return(list(c(dP1, dP2, dN)))
+        })
+    }) %>%
+    as.data.frame() %>%
+    gather(pop, n, -time)
+```
+
+```{r toy_model_plot}
+ toy_model %>%
+    ggplot(aes(x = time, y = n, color = pop)) +
+    geom_line(size = 1) +
+    theme_bw() +
+    labs(x = 'Time (hr)',
+         y = 'Number of Cells',
+         color = '') +
+    theme(legend.position = c(.5, .8),
+          panel.grid = element_blank(),
+          legend.background = element_blank(),
+          panel.border = element_rect(size = 1.5)) -> toy_model_plot
+```
+
+```{r cc_index}
+# define calculate index function
+calculate_index <- function(mat, pos, neg = NULL, n) {
+    vecs <- list(pos = pos, neg = neg) %>%
+        map(function(x) {
+            ind <- rownames(mat) %in% x
+            m <- mat[ind,]
+            m
+        })
+    if(!is.null(neg)) {
+        (colSums(vecs$pos) - vecs$neg)/n
+    } else {
+        colSums(vecs$pos)/n
+    }
+}
+
+# cell cycle index genes
+indecies <- list(
+    pos = c('Mki67', 'Rb1', 'Hist1h2ae', 'Ccnb1', 'Cbx3', 'Gapdh', 'Ccnb2'),
+    neg = c('E2f1')
+)
+mat <- assay(dds_transform)
+time <- dds_transform$time
+
+cc_index <- tibble(
+    t = time[time %in% c(0, 24, 48)],
+    i = calculate_index(
+        mat[,time %in% c(0, 24, 48)],
+        indecies$pos,
+        indecies$neg,
+        8)
+)
+```
+
+```{r cc_index_ecdf}
+cc_index %>%
+    ggplot(aes(x = scales::rescale(i, to = c(0, 1)), color = as.factor(t))) +
+    stat_ecdf(size = 1.5) +
+    theme_bw() +
+    theme(legend.position = c(.2, .8),
+          panel.grid = element_blank(),
+          legend.background = element_blank(),
+          panel.border = element_rect(size = 1.5)) +
+    labs(x = 'Cell Cycle Index',
+         y = 'Cumulative Distribution',
+         color = '') -> cc_index_ecdf
+```
+
+```{r cc_expression}
+cc_expression <- mat[rownames(mat) %in% unlist(indecies), time %in% c(0, 24, 48)] %>%
+    melt() %>%
+    as_tibble() %>%
+    setNames(c('gene', 'id', 'count')) %>%
+    inner_join(tibble(id = dds$id, time = as.factor(dds$time)))
+```
+
+```{r cc_index_expression}
+cc_expression %>%
+    ggplot(aes(x = time, y = rescale(count, c(0, 1)))) +
+    geom_boxplot(notch = TRUE, size = 1) +
+    labs(x = 'Time (hr)',
+         y = 'Expression of Cell Cycle Genes') +
+    theme_bw() +
+    theme(panel.grid = element_blank(),
+          panel.border = element_rect(size = 1.5)) -> cc_index_expression
+```
+
+```{r cc_population_specific}
+# population specific expression of cell cycle index genes
+models <- map(list('24 vs 0 (hr)' = c(0, 24),
+                   '48 vs 24 (hr)' = c(24, 48)), function(t) {
+    ind <- dds$time %in% t
+    se <- dds[, ind]
+    se <- se[rowMeans(assay(se)) > 0,]
+    fac <- ifelse(se$time == t[1], 0, 1)
+    
+    refs <- map(markers, function(x) marker(assay(se), intersect(rownames(se), x)))
+    diffs <- map(refs, function(x) fac * x)
+    
+    gens <- unlist(indecies)
+    names(gens) <- unlist(indecies)
+
+    list(
+        P1 = map(gens,function(i) lm(assay(se)[i,] ~ refs$P1 + diffs$P1)),
+        P2 = map(gens,function(i) lm(assay(se)[i,] ~ refs$P2 + diffs$P2))
+    )
+})
+
+cr <- map_df(models,
+             function(t) map_df(t,
+                                function(p) map_df(p,
+                                                   function(p) {
+    tibble(cr = as.numeric(residuals(p) + as.matrix(p$model[,-1]) %*% p$coef[-1]),
+           ref = p$model[, 2],
+           diff = p$model[, 3])
+}, .id = 'gene'),.id = 'pop'), .id = 'time')
+```
+
+```{r cc_psea}
+cr %>%
+    ggplot(aes(x = ref, y = rescale(cr))) +
+    geom_point(size = .5, color = 'darkgray') +
+    geom_smooth(method = 'lm', se = FALSE) +
+    facet_grid(pop ~ time) +
+    labs(x = 'Population Specific Expression',
+         y = 'Partial Residuals') +
+    scale_y_continuous(breaks = seq(0, 1, .2), labels = seq(0, 1, .2)) +
+    theme_bw() +
+    theme(panel.grid = element_blank(),
+          panel.border = element_rect(size = 1.5),
+          strip.background = element_blank(),
+          strip.text.y = element_text(angle = 0),
+          panel.spacing = unit(-.1, 'cm')) -> cc_psea
 ```
 
 ```{r perturbations}
@@ -494,7 +735,7 @@ pharma_psa <- map2_df(pharma_mats, selected_list, function(m, f) {
 })
 ```
 
-```{r perturbations_plot}
+```{r format_perturbation_data}
 adipo_markers_df <- tibble(
     marker_type = rep(c('Adipogenic', 'Lipogenic'), each = 4),
     gene_id = c('Pparg', 'Cebpb', 'Cebpa', 'Adipoq', 'Lpl', 'Acly', 'Fasn', 'Lipe')
@@ -510,7 +751,7 @@ hmb <- pharma_de %>%
         rownames(m) <- .$treatment_type
         Heatmap(scale(m),
                 name = 'Fold-change',
-                col = de_color,
+                #col = de_color,
                 cluster_rows = FALSE,
                 cluster_row_slices = FALSE,
                 column_title = NULL,
@@ -546,11 +787,135 @@ psa <- as_tibble(pharma_psa) %>%
                 heatmap_legend_param = list(direction = "horizontal"),
                 show_heatmap_legend = FALSE)
     })
+```
 
-png(filename = 'manuscript/pharma_perturbations.png',
+## Tables
+
+```{r tables_dir}
+dir.create('manuscript/tables')
+```
+
+```{r enrichment_table}
+# merge annotation and enrichemnt
+inner_join(terms, comp) %>%
+    dplyr::filter(p.adjust < .2, Count > 2) %>%
+    unique() %>%
+    group_by(population, ontology) %>%
+    write_csv('manuscript/tables/marker_enrichment.csv')
+```
+
+```{r rnaseq_dataset}
+# adipo_counts
+colData(adipo_counts) %>%
+    as_tibble() %>%
+    group_by(study, bibtexkey) %>%
+    summarise(time = paste0(min(time), ':', max(time))) %>%
+    dplyr::select(study, time, bibtexkey) %>%
+    mutate(bibtexkey = paste0('\\cite{', bibtexkey, '}')) %>%
+    setNames(c('SRA ID', 'Time (hrs)', 'Ref.' )) %>%
+    xtable(align = 'clcc') %>%
+    print(floating = FALSE,
+          include.rownames = FALSE,
+          booktabs = TRUE,
+          sanitize.text.function = identity,
+          comment = FALSE,
+          file = 'manuscript/tables/counts_data.tex')
+```
+
+```{r microarrays_perturbation_dataset}
+# microarrays dataset table
+read_csv('data/perturbations_md.csv') %>%
+    arrange(treatment_type) %>%
+    group_by(series_id, citation) %>%
+    summarise(cat = unique(treatment_category)[-1],
+              treatment = paste(unique(treatment_type)[-1], collapse = '/ ')) %>%
+    dplyr::select(series_id, cat, treatment, citation) %>%
+    mutate(citation = paste0('\\cite{', citation, '}')) %>%
+    setNames(c('GEO ID', 'Type', 'Treatment', 'Ref.' )) %>%
+    xtable(align = 'cllp{.2\\textwidth}c') %>%
+    print(floating = FALSE,
+          include.rownames = FALSE,
+          booktabs = TRUE,
+          sanitize.text.function = identity,
+          comment = FALSE,
+          file = 'manuscript/tables/pharma_data.tex')
+```
+
+## Figures
+
+```{r figures_dir}
+dir.create('manuscript/figures')
+```
+
+```{r subpopulations}
+plot_grid(mds,
+          simplexplot,
+          fraction_time,
+          primary_adipocytes,
+          ncol = 2,
+          scale = .9,
+          labels = 'AUTO',
+          label_fontface = 'plain') %>%
+    ggsave(plot = .,
+           filename = 'manuscript/figures/subpopulations.png',
+           height = 15, width = 15, units = 'cm')
+```
+
+```{r markers_iterations}
+plot_grid(markers_fc,
+          fraction_time_iterations,
+          ncol = 1,
+          scale = .9,
+          labels = 'AUTO',
+          label_fontface = 'plain') %>%
+    ggsave(plot = .,
+           filename = 'manuscript/figures/markers_iterations.png',
+           height = 15, width = 12, units = 'cm')
+```
+
+```{r heatmaps.png}
+png(filename = 'manuscript/figures/heatmaps.png',
+    height = 10, width = 13, units = 'cm', res = 300)
+
+grid.arrange(arrangeGrob(rasterGrob(readPNG('manuscript/adipogenic_markers.png')),
+                         top = textGrob("A", x = unit(0, "npc"), y = unit(1, "npc"), just=c("left","top"))),
+             arrangeGrob(
+                 arrangeGrob(rasterGrob(readPNG('manuscript/other_markers.png')),
+                             top = textGrob("B", x = unit(0, "npc"), y = unit(1, "npc"), just=c("left","top"))),
+                 arrangeGrob(rasterGrob(readPNG('manuscript/distances.png')),
+                             top = textGrob("C", x = unit(0, "npc"), y = unit(1, "npc"), just=c("left","top"))),
+             ncol = 1),
+             nrow = 1)
+dev.off()
+
+# remove individual heatmaps files
+unlink('manuscript/adipogenic_markers.png')
+unlink('manuscript/other_markers.png')
+unlink('manuscript/distances.png')
+```
+
+```{r cell_cycle.png}
+plot_grid(toy_model_plot,
+          cc_index_ecdf, 
+          cc_index_expression, 
+          cc_psea,
+          ncol = 2,
+          scale = .9,
+          labels = 'AUTO',
+          label_fontface = 'plain') %>%
+ggsave(plot = .,
+       filename = 'manuscript/figures/cell_cycle.png',
+       height = 15, width = 16, units = 'cm')
+```
+
+```{r perturbation_plot}
+# make a plot
+png(filename = 'manuscript/figures/pharma_perturbations.png',
     width = 12, height = 30, units = 'cm', res = 300)
+
 draw(psa %v% hmb,
      heatmap_legend_side = "bottom", 
      annotation_legend_side = "bottom")
+
 dev.off()
 ```
