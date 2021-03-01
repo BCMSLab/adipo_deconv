@@ -4,3 +4,6 @@
 [submodule "debCAM"]
 	path = debCAM
 	url = https://github.com/MahShaaban/debCAM/
+[submodule "preprint"]
+	path = preprint
+	url = https://git.overleaf.com/60389b8cd2827e7637928e16
